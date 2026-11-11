@@ -401,7 +401,20 @@ export interface SemanticMetrics {
     fallbacks: number;
     fallback_rate: number;
   };
+  pipeline: {
+    stages: Record<string, PipelineStageMetrics>;
+  };
   vision: VisionMetrics;
+}
+
+export interface PipelineStageMetrics {
+  samples: number;
+  calls: number;
+  avg_ms: number;
+  p50_ms: number;
+  p95_ms: number;
+  max_ms: number;
+  status: Record<string, number>;
 }
 
 export function getSemanticMetrics(token: string): Promise<SemanticMetrics> {

@@ -56,6 +56,15 @@ class SemanticMetricsCollector:
         self._rerank_total = 0
         self._rerank_fallbacks = 0
 
+        # 检索链路阶段耗时：rewrite / metadata / search / rerank / parent_fetch / total
+        # 每个阶段只保留最近 200 次，内存恒定；status 用于区分超时与跳过。
+        self._stage_durations: dict[str, deque[int]] = defaultdict(
+            lambda: deque(maxlen=200)
+        )
+        self._stage_status: dict[str, dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+
         # 视觉链路：耗时、超时、重试与体积压缩
         self._vision_total = 0
         self._vision_success = 0
@@ -130,6 +139,28 @@ class SemanticMetricsCollector:
             if fallback_used:
                 self._rerank_fallbacks += 1
 
+    def record_pipeline_stage(
+        self, stage: str, duration_ms: int, *, status: str = "ok"
+    ) -> None:
+        """记录检索链路某个阶段的耗时与状态。
+
+        Args:
+            stage: rewrite / metadata / search / rerank / parent_fetch / total。
+            duration_ms: 实际耗时（毫秒）。
+            status: ok / timeout / skipped / degraded / error。
+        """
+        try:
+            name = str(stage or "unknown")
+            elapsed = max(0, int(duration_ms))
+            state = str(status or "ok")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Skipping invalid pipeline metric: %s", exc)
+            return
+
+        with self._lock:
+            self._stage_durations[name].append(elapsed)
+            self._stage_status[name][state] += 1
+
     def record_vision(
         self,
         *,
@@ -179,6 +210,25 @@ class SemanticMetricsCollector:
             self._vision_bytes_in += in_bytes
             self._vision_bytes_out += out_bytes
 
+    def _stage_summary_unlocked(self) -> dict[str, dict[str, Any]]:
+        """Build per-stage latency/status summaries. Caller must hold the lock."""
+        summary: dict[str, dict[str, Any]] = {}
+        for stage in sorted(self._stage_durations):
+            durations = self._stage_durations[stage]
+            status_counts = self._stage_status[stage]
+            summary[stage] = {
+                "samples": len(durations),
+                "calls": sum(status_counts.values()),
+                "avg_ms": (
+                    round(sum(durations) / len(durations)) if durations else 0
+                ),
+                "p50_ms": _percentile(durations, 0.5),
+                "p95_ms": _percentile(durations, 0.95),
+                "max_ms": max(durations, default=0),
+                "status": dict(status_counts),
+            }
+        return summary
+
     def snapshot(self) -> dict[str, Any]:
         """Return counters plus derived rates."""
         with self._lock:
@@ -219,6 +269,7 @@ class SemanticMetricsCollector:
                         self._rerank_fallbacks, self._rerank_total
                     ),
                 },
+                "pipeline": {"stages": self._stage_summary_unlocked()},
                 "vision": {
                     "total": self._vision_total,
                     "success": self._vision_success,

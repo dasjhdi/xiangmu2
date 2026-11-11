@@ -2,6 +2,7 @@
 
 import json
 import sys
+import time
 import types
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -174,6 +175,7 @@ def test_reset_clears_all_counters():
     collector.record_intent(intent="recipe_search", confidence=0.9, needs_clarification=False)
     collector.record_retrieval(source="milvus", doc_count=1, cache_hit=True)
     collector.record_rerank(fallback_used=True)
+    collector.record_pipeline_stage("search", 120)
 
     collector.reset()
     snapshot = collector.snapshot()
@@ -183,6 +185,7 @@ def test_reset_clears_all_counters():
     assert snapshot["retrieval"]["total"] == 0
     assert snapshot["retrieval"]["by_source"] == {}
     assert snapshot["rerank"]["total"] == 0
+    assert snapshot["pipeline"]["stages"] == {}
 
 
 def test_concurrent_recording_does_not_lose_counts():
@@ -225,6 +228,49 @@ async def test_intent_detector_records_metrics():
     semantic_metrics.reset()
 
 
+def test_pipeline_stage_latency_and_status():
+    collector = SemanticMetricsCollector()
+    for value in (100, 200, 300, 400, 500):
+        collector.record_pipeline_stage("search", value)
+    collector.record_pipeline_stage("search", 5000, status="timeout")
+    collector.record_pipeline_stage("rewrite", 1, status="skipped")
+
+    stages = collector.snapshot()["pipeline"]["stages"]
+
+    assert stages["search"]["samples"] == 6
+    assert stages["search"]["calls"] == 6
+    assert stages["search"]["max_ms"] == 5000
+    assert stages["search"]["p50_ms"] == 300
+    assert stages["search"]["p95_ms"] == 5000
+    assert stages["search"]["status"] == {"ok": 5, "timeout": 1}
+    assert stages["rewrite"]["status"] == {"skipped": 1}
+
+
+def test_pipeline_stage_ignores_invalid_values():
+    collector = SemanticMetricsCollector()
+    collector.record_pipeline_stage("search", -10, status="ok")
+    collector.record_pipeline_stage("search", "not-a-number")  # type: ignore[arg-type]
+
+    stages = collector.snapshot()["pipeline"]["stages"]
+
+    assert stages["search"]["samples"] == 1
+    assert stages["search"]["max_ms"] == 0
+
+
+def test_rag_service_records_stage_latency():
+    semantic_metrics.reset()
+    RAGService = _load_rag_service_class()
+    service = RAGService.__new__(RAGService)
+
+    service._record_stage("search", time.perf_counter() - 0.05)
+
+    stage = semantic_metrics.snapshot()["pipeline"]["stages"]["search"]
+    assert stage["samples"] == 1
+    assert stage["p50_ms"] >= 40
+    assert stage["status"] == {"ok": 1}
+    semantic_metrics.reset()
+
+
 async def test_rerank_fallback_is_recorded():
     semantic_metrics.reset()
     RAGService = _load_rag_service_class()
@@ -239,10 +285,11 @@ async def test_rerank_fallback_is_recorded():
     service.reranker.rerank = rerank_with_fallback
 
     docs = [Document(page_content="番茄炒蛋")]
-    result = await service._rerank_if_needed("番茄炒蛋", docs)
+    result, status = await service._rerank_if_needed("番茄炒蛋", docs)
     snapshot = semantic_metrics.snapshot()
 
     assert result == docs
+    assert status == "degraded"
     assert snapshot["rerank"]["total"] == 1
     assert snapshot["rerank"]["fallbacks"] == 1
     semantic_metrics.reset()

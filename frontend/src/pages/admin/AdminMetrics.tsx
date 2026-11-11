@@ -16,11 +16,22 @@ import {
   RefreshCcw,
   Timer,
   TrendingDown,
+  Workflow,
 } from 'lucide-react';
-import type { SemanticMetrics } from '../../services/api/admin';
+import type { PipelineStageMetrics, SemanticMetrics } from '../../services/api/admin';
 import { getSemanticMetrics } from '../../services/api/admin';
 
 const REFRESH_MS = 30_000;
+
+const STAGE_ORDER = ['total', 'rewrite', 'metadata', 'search', 'rerank', 'parent_fetch'];
+const STAGE_LABELS: Record<string, string> = {
+  total: '全链路',
+  rewrite: '查询改写',
+  metadata: '元数据过滤',
+  search: '混合检索',
+  rerank: '重排',
+  parent_fetch: '父文档回填',
+};
 
 const pct = (value: number) => `${(value * 100).toFixed(1)}%`;
 const ms = (value: number) =>
@@ -90,6 +101,72 @@ function Card({
       </div>
       {children}
     </div>
+  );
+}
+
+function PipelineCard({ stages }: { stages: Record<string, PipelineStageMetrics> }) {
+  const names = [
+    ...STAGE_ORDER.filter((name) => stages[name]),
+    ...Object.keys(stages).filter((name) => !STAGE_ORDER.includes(name)).sort(),
+  ];
+  if (names.length === 0) {
+    return (
+      <Card title="检索链路耗时" icon={Workflow}>
+        <p className="py-4 text-sm text-gray-400">
+          还没有检索请求。发起一次对话后，这里会按阶段给出 P50 / P95。
+        </p>
+      </Card>
+    );
+  }
+
+  const tone = (name: string, p95: number) => {
+    const warn = name === 'total' ? 3000 : 1500;
+    const bad = name === 'total' ? 6000 : 3000;
+    return p95 >= bad ? 'text-red-500' : p95 >= warn ? 'text-amber-500' : 'text-gray-700 dark:text-gray-200';
+  };
+
+  return (
+    <Card title="检索链路耗时" icon={Workflow}>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs uppercase tracking-wider text-gray-400">
+              <th className="py-1.5 pr-3 font-medium">阶段</th>
+              <th className="py-1.5 pr-3 font-medium">P50</th>
+              <th className="py-1.5 pr-3 font-medium">P95</th>
+              <th className="py-1.5 pr-3 font-medium">最大</th>
+              <th className="py-1.5 pr-3 font-medium">样本</th>
+              <th className="py-1.5 font-medium">状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            {names.map((name) => {
+              const stage = stages[name];
+              const status = Object.entries(stage.status ?? {})
+                .map(([key, count]) => `${key} ${count}`)
+                .join(' · ');
+              return (
+                <tr key={name} className="border-t border-gray-100 dark:border-gray-800">
+                  <td className="py-1.5 pr-3 text-gray-600 dark:text-gray-300">
+                    {STAGE_LABELS[name] ?? name}
+                  </td>
+                  <td className="py-1.5 pr-3 tabular-nums">{ms(stage.p50_ms)}</td>
+                  <td className={`py-1.5 pr-3 tabular-nums font-medium ${tone(name, stage.p95_ms)}`}>
+                    {ms(stage.p95_ms)}
+                  </td>
+                  <td className="py-1.5 pr-3 tabular-nums text-gray-500">{ms(stage.max_ms)}</td>
+                  <td className="py-1.5 pr-3 tabular-nums text-gray-500">{stage.samples}</td>
+                  <td className="py-1.5 text-xs text-gray-500">{status || '—'}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <p className="mt-2 text-xs leading-relaxed text-gray-400">
+        每阶段保留最近 200 次样本。改写/重排出现 timeout 时会自动降级，不影响回答。
+      </p>
+    </Card>
   );
 }
 
@@ -188,6 +265,8 @@ export default function AdminMetrics({ token }: { token: string }) {
               icon={AlertTriangle}
             />
           </div>
+
+          <PipelineCard stages={data?.pipeline?.stages ?? {}} />
 
           <div className="grid gap-3 md:grid-cols-2">
             <Card title="视觉延迟与稳定性" icon={Timer}>

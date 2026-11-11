@@ -6,6 +6,7 @@ All documents are stored in PostgreSQL and Milvus, no in-memory document storage
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -27,9 +28,15 @@ from app.rag.pipeline.context_formatter import (
 )
 from app.rag.pipeline.document_processor import document_processor
 from app.rag.pipeline.query_planner import QueryPlanner
+from app.rag.pipeline.query_policy import (
+    dish_names_from_catalog,
+    is_explicit_recipe_query,
+    needs_metadata_filter,
+)
 from app.rag.pipeline.retrieval import RetrievalOptimizationModule, merge_documents
 from app.rag.pipeline.generation import GenerationIntegrationModule
 from app.rag.pipeline.metadata_filter import MetadataFilterExtractor
+from app.rag.pipeline.metadata_policy import build_metadata_expression
 from app.rag.rerankers.base import BaseReranker
 from app.rag.rerankers.lexical_reranker import FaultTolerantReranker, LexicalReranker
 from app.rag.cache import CacheManager, build_cache_scope
@@ -187,23 +194,90 @@ class RAGService:
             raise RuntimeError("RAG Service is not properly initialized.")
 
         logger.info("retrieval start query='%s'", query[:80])
+        total_started = time.perf_counter()
 
-        # Query rewriting
-        rewritten_query = (
-            query
-            if skip_rewrite
-            else await self.generation_module.rewrite_query(
-                query, user_id=user_id, conversation_id=conversation_id
-            )
+        # Query rewriting: 预算内完成；超时或问题已明确时退回原查询
+        filter_catalog = document_repository.get_metadata_for_filter(user_id)
+        dish_names = dish_names_from_catalog(filter_catalog)
+        rule_expression = build_metadata_expression(
+            query, filter_catalog, dish_names=dish_names
         )
+        explicit_query = (
+            self.config.retrieval.skip_rewrite_when_explicit
+            and is_explicit_recipe_query(query, dish_names)
+        )
+        rewrite_started = time.perf_counter()
+        if skip_rewrite:
+            # 调用方已完成改写（如对话服务），这里不重复记录，避免指标双算
+            rewritten_query = query
+        else:
+            rewrite_status = "skipped"
+            if explicit_query or not history_text.strip():
+                rewritten_query = query
+                logger.info(
+                    "Query rewrite skipped: %s",
+                    "query is self-contained" if explicit_query else "no history",
+                )
+            else:
+                rewrite_status = "ok"
+                try:
+                    rewritten_query = await asyncio.wait_for(
+                        self.generation_module.rewrite_query(
+                            query, user_id=user_id, conversation_id=conversation_id
+                        ),
+                        timeout=self.config.retrieval.rewrite_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    rewrite_status = "timeout"
+                    logger.warning(
+                        "Query rewrite exceeded %.1fs, using original query",
+                        self.config.retrieval.rewrite_timeout_seconds,
+                    )
+                    rewritten_query = query
+                except Exception as exc:
+                    rewrite_status = "degraded"
+                    logger.warning(
+                        "Query rewrite failed, using original query: %s", exc
+                    )
+                    rewritten_query = query
+            self._record_stage("rewrite", rewrite_started, rewrite_status)
 
         # Metadata filter extraction (from cached metadata, no DB access)
-        filter_catalog = document_repository.get_metadata_for_filter(user_id)
-        metadata_expression = (
-            await self.metadata_filter_extractor.build_filter_expression(
-                query, filter_catalog, user_id, conversation_id
-            )
-        )
+        metadata_started = time.perf_counter()
+        metadata_status = "ok"
+        if rule_expression:
+            metadata_status = "rules"
+            metadata_expression = rule_expression
+            logger.info("Metadata filter resolved by rules: %s", rule_expression)
+        elif not needs_metadata_filter(
+            query,
+            has_personal_documents=bool(filter_catalog.get("Personal Documents")),
+        ):
+            metadata_status = "skipped"
+            metadata_expression = None
+            logger.info("Metadata filter skipped: no filter signals in query")
+        else:
+            try:
+                metadata_expression = await asyncio.wait_for(
+                    self.metadata_filter_extractor.build_filter_expression(
+                        query, filter_catalog, user_id, conversation_id
+                    ),
+                    timeout=self.config.retrieval.metadata_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                metadata_status = "timeout"
+                metadata_expression = None
+                logger.warning(
+                    "Metadata filter exceeded %.1fs, continuing without filter",
+                    self.config.retrieval.metadata_timeout_seconds,
+                )
+            except Exception as exc:
+                metadata_status = "degraded"
+                metadata_expression = None
+                logger.warning(
+                    "Metadata filter failed, continuing without filter: %s", exc
+                )
+        self._record_stage("metadata", metadata_started, metadata_status)
 
         # Optional multi-query decomposition. The original query is always first.
         queries = [rewritten_query]
@@ -217,6 +291,7 @@ class RAGService:
             )
 
         # Execute retrieval across all sources
+        search_started = time.perf_counter()
         all_retrieved_docs = await self._execute_retrieval(
             queries,
             self.config.retrieval.top_k,
@@ -224,19 +299,30 @@ class RAGService:
             metadata_expression,
             user_id,
         )
+        self._record_stage("search", search_started)
 
         # Rerank if enabled
-        reranked_docs = await self._rerank_if_needed(
-            rewritten_query, all_retrieved_docs
+        rerank_started = time.perf_counter()
+        skip_rerank = bool(
+            self.config.reranker.enabled
+            and getattr(self.config.reranker, "skip_rerank_when_explicit", False)
+            and explicit_query
         )
+        reranked_docs, rerank_status = await self._rerank_if_needed(
+            rewritten_query, all_retrieved_docs, skip=skip_rerank
+        )
+        self._record_stage("rerank", rerank_started, rerank_status)
 
         # Post-process: fetch parent documents from database
+        parent_started = time.perf_counter()
         processed_docs = await document_processor.post_process_retrieval(reranked_docs)
+        self._record_stage("parent_fetch", parent_started)
 
         # Extract sources first so context numbering matches the cards shown in UI
         sources = self._extract_sources(processed_docs)
         context = format_numbered_context(processed_docs, sources)
         self._log_retrieval_summary("processed", processed_docs)
+        self._record_stage("total", total_started)
 
         return RetrievalResult(
             original_query=query,
@@ -547,16 +633,80 @@ class RAGService:
     # Helper methods
     # =========================================================================
 
-    async def _rerank_if_needed(self, rewritten_query: str, docs_for_rerank):
-        if self.reranker and self.config.reranker.enabled:
-            logger.info("reranking docs=%d", len(docs_for_rerank))
-            before = getattr(self.reranker, "fallback_used", 0)
-            try:
-                return await self.reranker.rerank(rewritten_query, docs_for_rerank)
-            finally:
-                after = getattr(self.reranker, "fallback_used", before)
-                self._record_rerank_metrics(fallback_used=after > before)
-        return docs_for_rerank
+    async def _rerank_if_needed(
+        self,
+        rewritten_query: str,
+        docs_for_rerank: List[Document],
+        *,
+        skip: bool = False,
+    ) -> tuple[List[Document], str]:
+        """重排并截断候选。
+
+        Args:
+            skip: 明确查询跳过重排，只截断到 top_n。
+
+        Returns:
+            (documents, status)，status 为 ok / degraded / timeout / skipped。
+        """
+        if not (self.reranker and self.config.reranker.enabled):
+            # 重排关闭时仍按 top_n 截断，避免 9 篇上下文稀释回答
+            keep = getattr(self.config.reranker, "top_n", 5)
+            return docs_for_rerank[: max(1, keep)], "skipped"
+
+        max_candidates = getattr(
+            self.config.reranker, "max_candidates", len(docs_for_rerank)
+        )
+        top_n = getattr(self.config.reranker, "top_n", max_candidates)
+        timeout = getattr(self.config.reranker, "timeout_seconds", 30.0)
+
+        if skip:
+            logger.info("rerank skipped: explicit query")
+            return docs_for_rerank[: max(1, top_n)], "skipped"
+
+        candidates = list(docs_for_rerank)[: max(1, max_candidates)]
+        logger.info(
+            "reranking docs=%d (candidates=%d, keep=%d)",
+            len(docs_for_rerank),
+            len(candidates),
+            top_n,
+        )
+
+        before = getattr(self.reranker, "fallback_used", 0)
+        status = "ok"
+        try:
+            result = await asyncio.wait_for(
+                self.reranker.rerank(rewritten_query, candidates),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            status = "timeout"
+            logger.warning("rerank exceeded %.1fs, keeping retrieval order", timeout)
+            result = candidates
+        except Exception as exc:  # pragma: no cover - defensive
+            status = "degraded"
+            logger.warning("rerank failed, keeping retrieval order: %s", exc)
+            result = candidates
+
+        after = getattr(self.reranker, "fallback_used", before)
+        self._record_rerank_metrics(fallback_used=after > before)
+        if status == "ok" and after > before:
+            status = "degraded"
+
+        return result[: max(1, top_n)], status
+
+    @staticmethod
+    def _record_stage(
+        stage: str, started_at: float, status: str = "ok"
+    ) -> None:
+        """Record one pipeline stage without affecting retrieval."""
+        try:
+            semantic_metrics.record_pipeline_stage(
+                stage,
+                int((time.perf_counter() - started_at) * 1000),
+                status=status,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Failed to record pipeline stage %s: %s", stage, exc)
 
     @staticmethod
     def _record_rerank_metrics(*, fallback_used: bool) -> None:

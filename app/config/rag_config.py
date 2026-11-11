@@ -48,6 +48,12 @@ class RetrievalConfig(BaseModel):
     # LLM-driven query decomposition (extra latency/cost; off by default)
     multi_query_enabled: bool = False
     max_queries: int = 3
+    # 查询改写是最大的延迟抖动源：超过预算直接用原问题检索。
+    rewrite_timeout_seconds: float = 2.0
+    # 首轮或问题本身已包含明确菜名/做法时，跳过改写，省一次 fast LLM 往返。
+    skip_rewrite_when_explicit: bool = True
+    # 元数据过滤是第二次 fast LLM 调用，同样需要封顶。
+    metadata_timeout_seconds: float = 2.0
 
 
 class RerankerConfig(BaseModel):
@@ -63,6 +69,15 @@ class RerankerConfig(BaseModel):
     temperature: float = 0.0
     max_tokens: int = 8192
     score_threshold: float = 0.1
+    # 单次 HTTP 请求超时：30s 会让一次故障拖垮整轮对话，3s 足够正常请求。
+    request_timeout: float = 3.0
+    # 整个重排阶段的硬上限（含本地 cross-encoder 降级），超时保留原顺序。
+    timeout_seconds: float = 6.0
+    # 送入重排的候选数与重排后保留数：少而精，降低延迟与上下文噪声。
+    max_candidates: int = 6
+    top_n: int = 5
+    # 明确菜名/做法的查询，混合检索排序已足够好；重排反而会把正确菜名往后挪。
+    skip_rerank_when_explicit: bool = True
     # Optional local cross-encoder fallback (off by default; no model download at startup)
     local_cross_encoder_enabled: bool = False
     local_cross_encoder_model: Optional[str] = None

@@ -57,10 +57,19 @@ class SiliconFlowReranker(BaseReranker):
         }
 
         try:
+            timeout = float(getattr(self.config, "request_timeout", 3.0))
             async with httpx.AsyncClient() as client:
-                response = await client.post(self.api_url, headers=self.headers, json=payload, timeout=30.0)  # type: ignore
+                response = await client.post(
+                    self.api_url,
+                    headers=self.headers,
+                    json=payload,
+                    timeout=timeout,
+                )  # type: ignore
                 response.raise_for_status()
                 api_results = response.json()
+        except httpx.TimeoutException as e:
+            logger.error("Rerank API timed out after %ss", getattr(self.config, "request_timeout", 3.0))
+            raise RerankerUnavailableError("rerank API timed out") from e
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error occurred during rerank API call: {e}")
             logger.error(f"Response content: {e.response.text}")

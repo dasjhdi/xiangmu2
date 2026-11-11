@@ -128,13 +128,21 @@ retrieval:
   multi_query_enabled: false
   # Maximum number of queries (including the original query)
   max_queries: 3
+  # 查询改写超时（秒）：超时直接用原问题检索，避免一次抖动拖慢整轮对话
+  rewrite_timeout_seconds: 2.0
+  # 问题已足够明确（含具体菜名/做法）时跳过改写，省一次 fast LLM 往返
+  skip_rewrite_when_explicit: true
+  # 元数据过滤超时（秒）：超时退化为「不加过滤条件」
+  metadata_timeout_seconds: 2.0
 
 # 4.2 Reranker Configuration
 # ------------------------------------------------------------------------------
 # Reranker further refines retrieval results for better relevance.
 # Uses the normal LLM API key by default (can override with RERANKER_API_KEY)
 reranker:
-  enabled: true
+  # 默认关闭：130 条 golden set 上重排对 Hit@5 无增益（明确查询 Hit@1 反而 -4pp），
+  # 且是主要长尾（最慢 6s）。需要时可改回 true，超时与候选上限仍然生效。
+  enabled: false
   # Reranker provider type
   type: "siliconflow"
   # Model name for reranking
@@ -146,6 +154,15 @@ reranker:
   max_tokens: 8192
   # Minimum score threshold for reranked results
   score_threshold: 0.2
+  # 单次 HTTP 超时（秒）：正常重排约 1s，30s 会把一次故障放大成整轮超时
+  request_timeout: 3.0
+  # 整个重排阶段硬上限（含本地 cross-encoder 降级）；超时按检索顺序截断
+  timeout_seconds: 6.0
+  # 送入重排的候选数 / 重排后保留数：候选越少越快，5 篇足够支撑回答
+  max_candidates: 6
+  top_n: 5
+  # 明确菜名/做法的查询跳过重排：实测会把正确菜名往后挪，且多花约 1.2s
+  skip_rerank_when_explicit: true
   # Optional local cross-encoder fallback (requires sentence_transformers)
   local_cross_encoder_enabled: true
   local_cross_encoder_model: "D:/models/bge-reranker-v2-m3"

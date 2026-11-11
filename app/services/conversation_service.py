@@ -28,6 +28,8 @@ from app.conversation.answer_policy import (
     history_for_llm,
     max_tokens_for,
 )
+from app.observability import semantic_metrics
+from app.rag.pipeline.query_policy import dish_names_from_catalog, should_skip_rewrite
 from app.services.rag_service import rag_service_instance, RetrievalResult
 from app.services.user_service import user_service
 from app.services.evaluation_service import evaluation_service
@@ -681,16 +683,60 @@ class ConversationService:
         """
         yield self._emit_thinking(ctx, "⏳ 正在结合对话历史重写查询语句...")
 
+        retrieval_config = rag_service_instance.config.retrieval
+        rewrite_started = time.perf_counter()
+        rewrite_status = "skipped"
         try:
-            # Query rewriting
-            ctx.rewritten_query = await self.query_rewriter.rewrite(
-                current_query=ctx.message,
-                history_text=ctx.history_text,
-                user_id=ctx.user_id,
-                conversation_id=ctx.conv_id,
+            # 问题已足够明确时省掉这次 fast LLM 往返；拿不准就照常改写
+            dish_names = dish_names_from_catalog(
+                document_repository.get_metadata_for_filter(ctx.user_id)
             )
-            yield self._emit_thinking(ctx, f"✍️ 重写后的查询语句: {ctx.rewritten_query}")
+            if retrieval_config.skip_rewrite_when_explicit and should_skip_rewrite(
+                ctx.message, ctx.history_text, dish_names
+            ):
+                ctx.rewritten_query = ctx.message
+                yield self._emit_thinking(
+                    ctx,
+                    "✍️ 首轮对话，跳过查询改写"
+                    if not ctx.history_text.strip()
+                    else "✍️ 问题已足够明确，跳过查询改写",
+                )
+            else:
+                ctx.rewritten_query = await asyncio.wait_for(
+                    self.query_rewriter.rewrite(
+                        current_query=ctx.message,
+                        history_text=ctx.history_text,
+                        user_id=ctx.user_id,
+                        conversation_id=ctx.conv_id,
+                    ),
+                    timeout=retrieval_config.rewrite_timeout_seconds,
+                )
+                rewrite_status = "ok"
+                yield self._emit_thinking(
+                    ctx, f"✍️ 重写后的查询语句: {ctx.rewritten_query}"
+                )
+        except asyncio.TimeoutError:
+            rewrite_status = "timeout"
+            ctx.rewritten_query = ctx.message
+            logger.warning(
+                "Query rewrite exceeded %.1fs, using original query",
+                retrieval_config.rewrite_timeout_seconds,
+            )
+            yield self._emit_thinking(
+                ctx, "⚠️ 查询改写超时，改用原问题继续检索"
+            )
+        except Exception as exc:
+            rewrite_status = "degraded"
+            ctx.rewritten_query = ctx.message
+            logger.warning("Query rewrite failed, using original query: %s", exc)
+        finally:
+            semantic_metrics.record_pipeline_stage(
+                "rewrite",
+                int((time.perf_counter() - rewrite_started) * 1000),
+                status=rewrite_status,
+            )
 
+        try:
             # RAG retrieval
             yield self._emit_thinking(ctx, "🔎 正在从 CookHero 知识库中检索相关资料...")
 

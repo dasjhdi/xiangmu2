@@ -20,6 +20,9 @@
 | 图像生成 | `Kwai-Kolors/Kolors` | Agent 配图生成 | SiliconFlow API |
 | 评测 | 复用 fast 层 | RAGAS 的 faithfulness / answer_relevancy | 随 fast 层 |
 
+> **重排默认关闭**：130 条检索 golden set 上，重排对 Hit@5 无增益（明确菜名查询 Hit@1 反而 -4pp），
+> 且是主要长尾（最慢 6s）。`config.yml` → `reranker.enabled` 当前为 `false`，需要时改回 `true` 即可。
+
 选模方式不同：**fast / normal 每次调用随机选一个**（负载均衡），**vision 按列表顺序回退**。
 
 ---
@@ -120,9 +123,12 @@
 ### 3.5 Reranker
 
 - 配置：`config.yml` → `reranker`
+- **默认关闭**（`enabled: false`）：见第一节说明；关闭时仍按 `top_n: 5` 截断上下文
 - 主模型：`type: siliconflow` + `model_name` + `base_url`（`app/rag/rerankers/siliconflow_reranker.py`）
 - 回退链：`app/services/rag_service.py` 中组装 `FaultTolerantReranker(SiliconFlow → 本地 cross-encoder → 词法重排)`
 - 本地回退：`local_cross_encoder_enabled`、`local_cross_encoder_model`（当前 `D:/models/bge-reranker-v2-m3`）
+- 预算：`request_timeout: 3s`、整体 `timeout_seconds: 6s`、`max_candidates: 6`、`top_n: 5`
+- 明确菜名/做法的查询会跳过重排（`skip_rerank_when_explicit: true`），避免把正确菜名往后挪
 
 **注意**：重排失败是**静默降级**，不会报错。换模型后如果效果变差，先看后台「链路指标」里的重排回退率。
 
@@ -194,9 +200,10 @@
 ### C. 换 Reranker
 
 1. 改 `reranker.model_name` / `base_url` / `score_threshold`；
-2. 需要本地回退时，确认 `local_cross_encoder_model` 路径存在；
-3. 重启后端；
-4. 观察后台「链路指标」的重排回退率，确认没有静默降级。
+2. 把 `reranker.enabled` 改为 `true`；
+3. 需要本地回退时，确认 `local_cross_encoder_model` 路径存在；
+4. 重启后端；
+5. 观察后台「链路指标」的重排回退率，确认没有静默降级。
 
 ### D. 换视觉模型
 
